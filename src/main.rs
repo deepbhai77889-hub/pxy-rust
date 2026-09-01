@@ -29,19 +29,18 @@ struct AppState {
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    // Dual NVIDIA API keys with instant failover
     let keys = vec![
         "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".to_string(),
         "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".to_string(),
     ];
 
-    // High performance connection client: HTTP/2 Multiplexing + TCP Keep-Alive + Zero-Copy
+    // High performance connection client: Rustls TLS + HTTP/2 Multiplexing + TCP Keep-Alive
     let client = Client::builder()
         .http2_prior_knowledge()
         .tcp_nodelay(true)
         .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
-        .pool_max_idle_per_host(200)
-        .pool_idle_timeout(std::time::Duration::from_secs(120))
+        .pool_max_idle_per_host(250)
+        .pool_idle_timeout(std::time::Duration::from_secs(180))
         .build()
         .expect("Failed to initialize reqwest client");
 
@@ -49,6 +48,18 @@ async fn main() {
         client,
         keys,
         current_key_idx: AtomicUsize::new(0),
+    });
+
+    // ⚡ TCP Warm-up in Background: Pre-establishes TLS connection with NVIDIA before first user request!
+    let warm_state = state.clone();
+    tokio::spawn(async move {
+        let warm_payload = json!({
+            "model": "moonshotai/kimi-k3",
+            "messages": [{"role": "user", "content": "ping"}],
+            "max_tokens": 1
+        });
+        let _ = warm_state.send_nvidia_request(&warm_payload).await;
+        info!("⚡ NVIDIA HTTP/2 Connection Pool Warm-up Completed!");
     });
 
     let app = Router::new()
@@ -66,12 +77,12 @@ async fn main() {
     let addr = format!("0.0.0.0:{}", port);
     let listener = TcpListener::bind(&addr).await.expect("Failed to bind TcpListener");
 
-    println!(">>> RUST PROXY RUNNING ON {}", addr);
+    println!(">>> RUST EXTREME PROXY RUNNING ON {}", addr);
     axum::serve(listener, app).await.unwrap();
 }
 
 async fn health_check() -> &'static str {
-    "OK - Rust Gateway Active (Jemalloc + HTTP/2 Optimized)"
+    "OK - Rust Gateway Active (SIMD-Optimized + Rustls)"
 }
 
 impl AppState {
@@ -252,6 +263,23 @@ async fn anthropic_messages_handler(
                                             if data.trim() == "[DONE]" {
                                                 continue;
                                             }
+                                            // Ultra-fast zero copy text extraction
+                                            if let Some(content_idx) = data.find("\"content\":") {
+                                                let sub = &data[content_idx + 10..];
+                                                if sub.starts_with('"') {
+                                                    if let Some(end_quote) = sub[1..].find('"') {
+                                                        let delta = &sub[1..=end_quote];
+                                                        let delta_evt = format!(
+                                                            "{{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{}\"}}}}",
+                                                            delta.replace('\\', "\\\\").replace('"', "\\\"")
+                                                        );
+                                                        yield Ok(Bytes::from(format!("event: content_block_delta\ndata: {}\n\n", delta_evt)));
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                            
+                                            // Fallback to normal parser if reasoning chunk or complex JSON
                                             if let Ok(val) = serde_json::from_str::<Value>(data) {
                                                 if let Some(delta) = val.pointer("/choices/0/delta/content").and_then(|c| c.as_str()) {
                                                     let delta_evt = json!({
