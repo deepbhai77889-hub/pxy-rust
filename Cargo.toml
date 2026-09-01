@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-axum = { version = "0.7", features = ["http2"] }
+axum = { version = "0.7", features = ["http2", "json", "macros"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["stream", "http2", "json", "gzip", "brotli"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
@@ -14,6 +14,12 @@ futures-util = "0.3"
 http-body-util = "0.1"
 bytes = "1"
 hyper = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+async-stream = "0.3"
+uuid = { version = "1.10", features = ["v4"] }
+chrono = "0.4"
+tokio-stream = "0.1"
 
 [profile.release]
 opt-level = 3
