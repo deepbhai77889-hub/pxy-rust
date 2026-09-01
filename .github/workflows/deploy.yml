@@ -1,13 +1,13 @@
-name: Run Rust High Performance Relay
+name: Run High Performance Rust Gateway
 
 on:
   workflow_dispatch:
   schedule:
-    # Auto restart every 5 hours
+    # Auto re-trigger every 5 hours (GitHub Actions job limit is 6 hours)
     - cron: '0 */5 * * *'
 
 jobs:
-  run-rust-proxy:
+  run-rust-gateway:
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
@@ -20,24 +20,25 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Build Optimized Release Binary
+      - name: Build Optimized Binary
         run: cargo build --release
 
-      - name: Install Cloudflared Tunnel
+      - name: Install Cloudflared
         run: |
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cloudflared.deb
           sudo dpkg -i cloudflared.deb
           rm -f cloudflared.deb
 
-      - name: Start Rust Proxy Server
+      - name: Start Rust Gateway
         run: |
           ./target/release/pxy-rust &
           sleep 2
 
-      - name: Start Tunnel and Broadcast URL
+      - name: Start Quick Tunnel & Broadcast Live URL
         run: |
-          cloudflared tunnel --url http://localhost:3000 --no-autoupdate > tunnel.log 2>&1 &
-          
+          # Start cloudflared with http2 and max throughput flags
+          cloudflared tunnel --url http://localhost:3000 --no-autoupdate --http2-origin > tunnel.log 2>&1 &
+
           URL=""
           for i in {1..40}; do
             URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" tunnel.log | head -n 1 || true)
@@ -48,14 +49,18 @@ jobs:
           done
 
           if [ -z "$URL" ]; then
-            echo "Failed to start tunnel, log output:"
+            echo "Failed to start tunnel. Logs:"
             cat tunnel.log
             exit 1
           fi
 
           echo "================================================================="
-          echo ">>> RUST 1M CONTEXT PROXY URL: $URL <<<"
+          echo ">>> YOUR LIVE RUST AI GATEWAY URL: $URL <<<"
           echo "================================================================="
-          echo "### 🚀 Rust 1M-Context Proxy URL: \`$URL\`" >> $GITHUB_STEP_SUMMARY
+          echo "### 🚀 Live Rust AI Gateway: \`$URL\`" >> $GITHUB_STEP_SUMMARY
+          echo "#### Supported Endpoints:" >> $GITHUB_STEP_SUMMARY
+          echo "- **OpenAI**: \`$URL/v1/chat/completions\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Anthropic**: \`$URL/v1/messages\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Models**: \`$URL/v1/models\`" >> $GITHUB_STEP_SUMMARY
 
           wait -n
