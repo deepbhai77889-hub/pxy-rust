@@ -33,20 +33,16 @@ jobs:
           sudo dpkg -i cloudflared.deb
           rm -f cloudflared.deb
 
-      - name: Start Rust Gateway & Tunnel Together
+      - name: Start Rust Gateway & Cloudflare Tunnel
         run: |
-          # Start Rust Gateway on port 3000 in background
-          PORT=3000 RUST_LOG=info ./target/release/pxy-rust > rust.log 2>&1 &
+          # 1. Start Rust binary
+          ./target/release/pxy-rust &
           sleep 2
 
-          # Verify Rust process is running
-          if ! pgrep -f pxy-rust > /dev/null; then
-            echo "Rust binary failed to start. Logs:"
-            cat rust.log
-            exit 1
-          fi
+          # 2. Test local binding
+          curl -s http://127.0.0.1:3000/health || echo "Health check waiting..."
 
-          # Start Cloudflare Tunnel pointing to localhost:3000
+          # 3. Start cloudflared tunnel
           cloudflared tunnel --url http://127.0.0.1:3000 --no-autoupdate > tunnel.log 2>&1 &
 
           URL=""

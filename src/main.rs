@@ -32,7 +32,6 @@ async fn main() {
     ];
 
     let client = Client::builder()
-        .http2_prior_knowledge()
         .tcp_nodelay(true)
         .pool_max_idle_per_host(100)
         .pool_idle_timeout(std::time::Duration::from_secs(90))
@@ -46,6 +45,8 @@ async fn main() {
     });
 
     let app = Router::new()
+        .route("/", get(health_check))
+        .route("/health", get(health_check))
         // OpenAI Format Endpoints
         .route("/v1/models", get(list_models_handler))
         .route("/v1/chat/completions", post(openai_chat_handler))
@@ -57,12 +58,14 @@ async fn main() {
 
     let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
     let addr = format!("0.0.0.0:{}", port);
-    let listener = TcpListener::bind(&addr).await.unwrap();
+    let listener = TcpListener::bind(&addr).await.expect("Failed to bind TcpListener");
 
-    info!("🚀 Rust Ultra-Fast NVIDIA AI Gateway running on http://{}", addr);
-    info!("⚡ OpenAI (/v1/chat/completions) & Anthropic (/v1/messages) Supported!");
-    info!("⚡ Multi-modal Vision & Full Function Tool Calling Active!");
+    println!(">>> RUST PROXY LISTENING ON {}", addr);
     axum::serve(listener, app).await.unwrap();
+}
+
+async fn health_check() -> &'static str {
+    "OK - Rust Gateway Active"
 }
 
 // -----------------------------------------------------------------------------------------
@@ -98,7 +101,6 @@ impl AppState {
             match resp {
                 Ok(response) => {
                     let status = response.status();
-                    // If rate-limited (429) or forbidden (403) or service unavailable (503), switch key!
                     if status == StatusCode::TOO_MANY_REQUESTS
                         || status == StatusCode::FORBIDDEN
                         || status == StatusCode::UNAUTHORIZED
@@ -128,7 +130,6 @@ async fn openai_chat_handler(
     State(state): State<Arc<AppState>>,
     Json(mut payload): Json<Value>,
 ) -> Response {
-    // Normalizing model name (e.g. kimi-k3, deepseek, etc.)
     if let Some(m) = payload.get("model").and_then(|v| v.as_str()) {
         let clean_model = m.trim_start_matches("nvidia/").trim_start_matches("openai/");
         payload["model"] = json!(clean_model);
@@ -172,7 +173,7 @@ async fn openai_chat_handler(
 }
 
 // -----------------------------------------------------------------------------------------
-// Anthropic Endpoint Handler (/v1/messages) -> Translates Anthropic -> OpenAI -> Anthropic
+// Anthropic Endpoint Handler (/v1/messages)
 // -----------------------------------------------------------------------------------------
 async fn anthropic_messages_handler(
     State(state): State<Arc<AppState>>,
@@ -193,7 +194,6 @@ async fn anthropic_messages_handler(
         model
     };
 
-    // 1. Translate Anthropic Request Format -> OpenAI Request Format (Tools, Vision, Messages)
     let openai_payload = translate_anthropic_to_openai(&anthropic_req, &actual_model);
 
     match state.send_nvidia_request(&openai_payload).await {
@@ -204,13 +204,11 @@ async fn anthropic_messages_handler(
             }
 
             if is_stream {
-                // Stream translator: OpenAI SSE chunks -> Anthropic SSE Events
                 let msg_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
                 let model_name = actual_model.clone();
 
                 let byte_stream = upstream_resp.bytes_stream();
                 let anthropic_stream = async_stream::stream! {
-                    // Send initial message_start event
                     let start_evt = json!({
                         "type": "message_start",
                         "message": {
@@ -291,7 +289,6 @@ async fn anthropic_messages_handler(
                 );
                 resp
             } else {
-                // Non-streaming response translation
                 let openai_resp: Value = upstream_resp.json().await.unwrap_or_default();
                 let anthropic_resp = translate_openai_to_anthropic(&openai_resp, &actual_model);
                 Json(anthropic_resp).into_response()
@@ -307,7 +304,6 @@ async fn anthropic_messages_handler(
 fn translate_anthropic_to_openai(req: &Value, model: &str) -> Value {
     let mut openai_messages = Vec::new();
 
-    // 1. Handle Anthropic System Prompt
     if let Some(sys) = req.get("system") {
         let sys_content = if let Some(s) = sys.as_str() {
             s.to_string()
@@ -328,7 +324,6 @@ fn translate_anthropic_to_openai(req: &Value, model: &str) -> Value {
         }
     }
 
-    // 2. Handle Messages (Text, Vision Images & Tool Results)
     if let Some(messages) = req.get("messages").and_then(|v| v.as_array()) {
         for msg in messages {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
@@ -353,7 +348,6 @@ fn translate_anthropic_to_openai(req: &Value, model: &str) -> Value {
                             }
                         }
                         "image" => {
-                            // Convert Base64 / URL Image to OpenAI Image URL
                             if let Some(source) = block.get("source") {
                                 let mediatype = source.get("media_type").and_then(|m| m.as_str()).unwrap_or("image/jpeg");
                                 let data = source.get("data").and_then(|d| d.as_str()).unwrap_or("");
@@ -366,7 +360,6 @@ fn translate_anthropic_to_openai(req: &Value, model: &str) -> Value {
                             }
                         }
                         "tool_use" => {
-                            // Anthropic assistant tool call
                             let tool_id = block.get("id").and_then(|i| i.as_str()).unwrap_or("call_1");
                             let tool_name = block.get("name").and_then(|n| n.as_str()).unwrap_or("");
                             let input_val = block.get("input").cloned().unwrap_or(json!({}));
@@ -384,7 +377,6 @@ fn translate_anthropic_to_openai(req: &Value, model: &str) -> Value {
                             }));
                         }
                         "tool_result" => {
-                            // Anthropic tool output -> OpenAI tool role
                             let tool_id = block.get("tool_use_id").and_then(|i| i.as_str()).unwrap_or("call_1");
                             let content = block.get("content").map(|c| c.to_string()).unwrap_or_default();
 
@@ -416,7 +408,6 @@ fn translate_anthropic_to_openai(req: &Value, model: &str) -> Value {
         "max_tokens": req.get("max_tokens").unwrap_or(&json!(4096))
     });
 
-    // 3. Handle Tools / Function Definitions
     if let Some(tools) = req.get("tools").and_then(|t| t.as_array()) {
         let mut openai_tools = Vec::new();
         for t in tools {
@@ -485,9 +476,6 @@ fn translate_openai_to_anthropic(openai: &Value, model: &str) -> Value {
     })
 }
 
-// -----------------------------------------------------------------------------------------
-// Models list endpoint
-// -----------------------------------------------------------------------------------------
 async fn list_models_handler() -> Json<Value> {
     Json(json!({
         "object": "list",
