@@ -1,15 +1,18 @@
-name: Run High Performance Rust Gateway
+name: 24/7 Rust AI Gateway Loop
 
 on:
   workflow_dispatch:
   schedule:
-    # Auto re-trigger every 5 hours (GitHub Actions job limit is 6 hours)
+    # Trigger automatically every 5 hours
     - cron: '0 */5 * * *'
 
 jobs:
   run-rust-gateway:
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    permissions:
+      actions: write
+      contents: read
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -36,7 +39,6 @@ jobs:
 
       - name: Start Quick Tunnel & Broadcast Live URL
         run: |
-          # Start cloudflared with http2 and max throughput flags
           cloudflared tunnel --url http://localhost:3000 --no-autoupdate --http2-origin > tunnel.log 2>&1 &
 
           URL=""
@@ -55,12 +57,24 @@ jobs:
           fi
 
           echo "================================================================="
-          echo ">>> YOUR LIVE RUST AI GATEWAY URL: $URL <<<"
+          echo ">>> YOUR LIVE 24/7 RUST AI GATEWAY URL: $URL <<<"
           echo "================================================================="
-          echo "### 🚀 Live Rust AI Gateway: \`$URL\`" >> $GITHUB_STEP_SUMMARY
+          echo "### 🚀 Live 24/7 Rust AI Gateway: \`$URL\`" >> $GITHUB_STEP_SUMMARY
           echo "#### Supported Endpoints:" >> $GITHUB_STEP_SUMMARY
           echo "- **OpenAI**: \`$URL/v1/chat/completions\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Anthropic**: \`$URL/v1/messages\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Models**: \`$URL/v1/models\`" >> $GITHUB_STEP_SUMMARY
 
-          wait -n
+          # Background supervisor: Sleep 5 hours (18000s) then self-trigger next workflow run
+          (
+            sleep 18000
+            echo "Self-triggering next 5-hour cycle..."
+            curl -s -X POST \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              https://api.github.com/repos/${{ github.repository }}/actions/workflows/deploy.yml/dispatches \
+              -d '{"ref":"main"}' || true
+          ) &
+
+          # Keep the current runner alive for up to 345 minutes (~5.7 hours)
+          sleep 20700 || wait -n
