@@ -15,6 +15,10 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{error, info, warn};
 
+// Ultra-fast memory allocator for concurrent high-throughput workloads
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 struct AppState {
     client: Client,
     keys: Vec<String>,
@@ -31,10 +35,13 @@ async fn main() {
         "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".to_string(),
     ];
 
+    // High performance connection client: HTTP/2 Multiplexing + TCP Keep-Alive + Zero-Copy
     let client = Client::builder()
+        .http2_prior_knowledge()
         .tcp_nodelay(true)
-        .pool_max_idle_per_host(100)
-        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
+        .pool_max_idle_per_host(200)
+        .pool_idle_timeout(std::time::Duration::from_secs(120))
         .build()
         .expect("Failed to initialize reqwest client");
 
@@ -47,13 +54,10 @@ async fn main() {
     let app = Router::new()
         .route("/", get(health_check))
         .route("/health", get(health_check))
-        // Dynamic Models List (Fetches directly from NVIDIA catalog)
         .route("/v1/models", get(list_models_handler))
         .route("/models", get(list_models_handler))
-        // OpenAI Format Endpoints (Any NVIDIA model supported!)
         .route("/v1/chat/completions", post(openai_chat_handler))
         .route("/chat/completions", post(openai_chat_handler))
-        // Anthropic Messages Format Endpoint (Any model mapped dynamically!)
         .route("/v1/messages", post(anthropic_messages_handler))
         .route("/messages", post(anthropic_messages_handler))
         .with_state(state);
@@ -62,17 +66,14 @@ async fn main() {
     let addr = format!("0.0.0.0:{}", port);
     let listener = TcpListener::bind(&addr).await.expect("Failed to bind TcpListener");
 
-    println!(">>> RUST PROXY LISTENING ON {}", addr);
+    println!(">>> RUST PROXY RUNNING ON {}", addr);
     axum::serve(listener, app).await.unwrap();
 }
 
 async fn health_check() -> &'static str {
-    "OK - Rust Gateway Active (All NVIDIA Models Supported)"
+    "OK - Rust Gateway Active (Jemalloc + HTTP/2 Optimized)"
 }
 
-// -----------------------------------------------------------------------------------------
-// Helper: NVIDIA Forwarder with Auto Key Switch on Rate-Limit (429/403/503)
-// -----------------------------------------------------------------------------------------
 impl AppState {
     fn get_key(&self, attempt: usize) -> &str {
         let base = self.current_key_idx.load(Ordering::Relaxed);
@@ -125,14 +126,10 @@ impl AppState {
     }
 }
 
-// -----------------------------------------------------------------------------------------
-// OpenAI Endpoint Handler (/v1/chat/completions) - Supports ANY NVIDIA Model!
-// -----------------------------------------------------------------------------------------
 async fn openai_chat_handler(
     State(state): State<Arc<AppState>>,
     Json(mut payload): Json<Value>,
 ) -> Response {
-    // Clean model name dynamically: strip any user prefixes like "nvidia/", "openai/"
     if let Some(m) = payload.get("model").and_then(|v| v.as_str()) {
         let clean_model = m
             .trim_start_matches("nvidia/")
@@ -161,6 +158,10 @@ async fn openai_chat_handler(
                     axum::http::header::CACHE_CONTROL,
                     HeaderValue::from_static("no-cache"),
                 );
+                resp.headers_mut().insert(
+                    axum::http::header::HeaderName::from_static("x-accel-buffering"),
+                    HeaderValue::from_static("no"),
+                );
                 resp
             } else {
                 let bytes = upstream_resp.bytes().await.unwrap_or_default();
@@ -177,17 +178,12 @@ async fn openai_chat_handler(
     }
 }
 
-// -----------------------------------------------------------------------------------------
-// Anthropic Endpoint Handler (/v1/messages) - Dynamically Maps to ANY requested model!
-// -----------------------------------------------------------------------------------------
 async fn anthropic_messages_handler(
     State(state): State<Arc<AppState>>,
     Json(anthropic_req): Json<Value>,
 ) -> Response {
     let is_stream = anthropic_req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     
-    // Allow any model! If user passes a custom NVIDIA model, preserve it.
-    // If user passes standard Claude model names ("claude-3-5-sonnet", etc.), map to default kimi-k3 or user choice.
     let raw_model = anthropic_req
         .get("model")
         .and_then(|v| v.as_str())
@@ -239,7 +235,7 @@ async fn anthropic_messages_handler(
                     });
                     yield Ok(Bytes::from(format!("event: content_block_start\ndata: {}\n\n", content_start)));
 
-                    let mut buffer = String::new();
+                    let mut buffer = String::with_capacity(4096);
                     tokio::pin!(byte_stream);
 
                     while let Some(chunk_res) = byte_stream.next().await {
@@ -249,7 +245,7 @@ async fn anthropic_messages_handler(
 
                                 while let Some(pos) = buffer.find("\n\n") {
                                     let line_block = buffer[..pos].to_string();
-                                    buffer = buffer[pos + 2..].to_string();
+                                    buffer.drain(..pos + 2);
 
                                     for line in line_block.lines() {
                                         if let Some(data) = line.strip_prefix("data: ") {
@@ -295,6 +291,10 @@ async fn anthropic_messages_handler(
                     axum::http::header::CONTENT_TYPE,
                     HeaderValue::from_static("text/event-stream; charset=utf-8"),
                 );
+                resp.headers_mut().insert(
+                    axum::http::header::HeaderName::from_static("x-accel-buffering"),
+                    HeaderValue::from_static("no"),
+                );
                 resp
             } else {
                 let openai_resp: Value = upstream_resp.json().await.unwrap_or_default();
@@ -306,9 +306,6 @@ async fn anthropic_messages_handler(
     }
 }
 
-// -----------------------------------------------------------------------------------------
-// Translation Logic: Anthropic Schema <---> OpenAI Schema
-// -----------------------------------------------------------------------------------------
 fn translate_anthropic_to_openai(req: &Value, model: &str) -> Value {
     let mut openai_messages = Vec::new();
 
@@ -484,9 +481,6 @@ fn translate_openai_to_anthropic(openai: &Value, model: &str) -> Value {
     })
 }
 
-// -----------------------------------------------------------------------------------------
-// Dynamic Models Catalog (Fetches direct from NVIDIA catalog)
-// -----------------------------------------------------------------------------------------
 async fn list_models_handler(State(state): State<Arc<AppState>>) -> Response {
     let api_key = state.get_key(0);
     let resp = state
@@ -506,14 +500,11 @@ async fn list_models_handler(State(state): State<Arc<AppState>>) -> Response {
             ).into_response()
         }
         Err(_) => {
-            // Fallback default list if upstream network fails
             Json(json!({
                 "object": "list",
                 "data": [
                     { "id": "moonshotai/kimi-k3", "object": "model", "owned_by": "nvidia" },
-                    { "id": "deepseek-ai/deepseek-v3", "object": "model", "owned_by": "nvidia" },
-                    { "id": "meta/llama-3.3-70b-instruct", "object": "model", "owned_by": "nvidia" },
-                    { "id": "mistralai/mistral-large-2-instruct", "object": "model", "owned_by": "nvidia" }
+                    { "id": "meta/llama-3.2-11b-vision-instruct", "object": "model", "owned_by": "nvidia" }
                 ]
             })).into_response()
         }
