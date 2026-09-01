@@ -33,14 +33,21 @@ jobs:
           sudo dpkg -i cloudflared.deb
           rm -f cloudflared.deb
 
-      - name: Start Rust Gateway
+      - name: Start Rust Gateway & Tunnel Together
         run: |
-          ./target/release/pxy-rust &
+          # Start Rust Gateway on port 3000 in background
+          PORT=3000 RUST_LOG=info ./target/release/pxy-rust > rust.log 2>&1 &
           sleep 2
 
-      - name: Start Quick Tunnel & Broadcast Live URL
-        run: |
-          cloudflared tunnel --url http://localhost:3000 --no-autoupdate --http2-origin > tunnel.log 2>&1 &
+          # Verify Rust process is running
+          if ! pgrep -f pxy-rust > /dev/null; then
+            echo "Rust binary failed to start. Logs:"
+            cat rust.log
+            exit 1
+          fi
+
+          # Start Cloudflare Tunnel pointing to localhost:3000
+          cloudflared tunnel --url http://127.0.0.1:3000 --no-autoupdate > tunnel.log 2>&1 &
 
           URL=""
           for i in {1..40}; do
@@ -83,5 +90,5 @@ jobs:
               -d '{"ref":"main"}' || true
           ) &
 
-          # Keep the current runner alive for up to 345 minutes (~5.7 hours)
+          # Keep runner active
           sleep 20700 || wait -n
