@@ -25,7 +25,7 @@ struct AppState {
 async fn main() {
     tracing_subscriber::fmt::init();
 
-    // Default 2 NVIDIA API keys with instant failover
+    // Dual NVIDIA API keys with instant failover
     let keys = vec![
         "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".to_string(),
         "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".to_string(),
@@ -47,11 +47,13 @@ async fn main() {
     let app = Router::new()
         .route("/", get(health_check))
         .route("/health", get(health_check))
-        // OpenAI Format Endpoints
+        // Dynamic Models List (Fetches directly from NVIDIA catalog)
         .route("/v1/models", get(list_models_handler))
+        .route("/models", get(list_models_handler))
+        // OpenAI Format Endpoints (Any NVIDIA model supported!)
         .route("/v1/chat/completions", post(openai_chat_handler))
         .route("/chat/completions", post(openai_chat_handler))
-        // Anthropic Messages Format Endpoint
+        // Anthropic Messages Format Endpoint (Any model mapped dynamically!)
         .route("/v1/messages", post(anthropic_messages_handler))
         .route("/messages", post(anthropic_messages_handler))
         .with_state(state);
@@ -65,7 +67,7 @@ async fn main() {
 }
 
 async fn health_check() -> &'static str {
-    "OK - Rust Gateway Active"
+    "OK - Rust Gateway Active (All NVIDIA Models Supported)"
 }
 
 // -----------------------------------------------------------------------------------------
@@ -124,14 +126,17 @@ impl AppState {
 }
 
 // -----------------------------------------------------------------------------------------
-// OpenAI Endpoint Handler (/v1/chat/completions)
+// OpenAI Endpoint Handler (/v1/chat/completions) - Supports ANY NVIDIA Model!
 // -----------------------------------------------------------------------------------------
 async fn openai_chat_handler(
     State(state): State<Arc<AppState>>,
     Json(mut payload): Json<Value>,
 ) -> Response {
+    // Clean model name dynamically: strip any user prefixes like "nvidia/", "openai/"
     if let Some(m) = payload.get("model").and_then(|v| v.as_str()) {
-        let clean_model = m.trim_start_matches("nvidia/").trim_start_matches("openai/");
+        let clean_model = m
+            .trim_start_matches("nvidia/")
+            .trim_start_matches("openai/");
         payload["model"] = json!(clean_model);
     }
 
@@ -173,25 +178,28 @@ async fn openai_chat_handler(
 }
 
 // -----------------------------------------------------------------------------------------
-// Anthropic Endpoint Handler (/v1/messages)
+// Anthropic Endpoint Handler (/v1/messages) - Dynamically Maps to ANY requested model!
 // -----------------------------------------------------------------------------------------
 async fn anthropic_messages_handler(
     State(state): State<Arc<AppState>>,
     Json(anthropic_req): Json<Value>,
 ) -> Response {
     let is_stream = anthropic_req.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-    let model = anthropic_req
+    
+    // Allow any model! If user passes a custom NVIDIA model, preserve it.
+    // If user passes standard Claude model names ("claude-3-5-sonnet", etc.), map to default kimi-k3 or user choice.
+    let raw_model = anthropic_req
         .get("model")
         .and_then(|v| v.as_str())
-        .unwrap_or("moonshotai/kimi-k3")
-        .trim_start_matches("anthropic/")
-        .trim_start_matches("claude-")
-        .to_string();
+        .unwrap_or("moonshotai/kimi-k3");
 
-    let actual_model = if model.is_empty() || model.starts_with("3") {
+    let actual_model = if raw_model.starts_with("claude-") || raw_model.starts_with("anthropic/claude-") {
         "moonshotai/kimi-k3".to_string()
     } else {
-        model
+        raw_model
+            .trim_start_matches("anthropic/")
+            .trim_start_matches("nvidia/")
+            .to_string()
     };
 
     let openai_payload = translate_anthropic_to_openai(&anthropic_req, &actual_model);
@@ -476,17 +484,40 @@ fn translate_openai_to_anthropic(openai: &Value, model: &str) -> Value {
     })
 }
 
-async fn list_models_handler() -> Json<Value> {
-    Json(json!({
-        "object": "list",
-        "data": [
-            { "id": "moonshotai/kimi-k3", "object": "model", "owned_by": "nvidia" },
-            { "id": "deepseek-ai/deepseek-v3", "object": "model", "owned_by": "nvidia" },
-            { "id": "meta/llama-3.3-70b-instruct", "object": "model", "owned_by": "nvidia" },
-            { "id": "mistralai/mistral-large-2-instruct", "object": "model", "owned_by": "nvidia" },
-            { "id": "claude-3-5-sonnet-20241022", "object": "model", "owned_by": "anthropic-translated" }
-        ]
-    }))
+// -----------------------------------------------------------------------------------------
+// Dynamic Models Catalog (Fetches direct from NVIDIA catalog)
+// -----------------------------------------------------------------------------------------
+async fn list_models_handler(State(state): State<Arc<AppState>>) -> Response {
+    let api_key = state.get_key(0);
+    let resp = state
+        .client
+        .get("https://integrate.api.nvidia.com/v1/models")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .send()
+        .await;
+
+    match resp {
+        Ok(nvidia_models) => {
+            let bytes = nvidia_models.bytes().await.unwrap_or_default();
+            (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"))],
+                bytes,
+            ).into_response()
+        }
+        Err(_) => {
+            // Fallback default list if upstream network fails
+            Json(json!({
+                "object": "list",
+                "data": [
+                    { "id": "moonshotai/kimi-k3", "object": "model", "owned_by": "nvidia" },
+                    { "id": "deepseek-ai/deepseek-v3", "object": "model", "owned_by": "nvidia" },
+                    { "id": "meta/llama-3.3-70b-instruct", "object": "model", "owned_by": "nvidia" },
+                    { "id": "mistralai/mistral-large-2-instruct", "object": "model", "owned_by": "nvidia" }
+                ]
+            })).into_response()
+        }
+    }
 }
 
 fn json_error(status: StatusCode, msg: &str) -> Response {
