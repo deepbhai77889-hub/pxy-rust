@@ -30,49 +30,50 @@ jobs:
       - name: Build Optimized Binary
         run: cargo build --release
 
-      - name: Install Cloudflared & LocalXpose
+      - name: Install Cloudflared
         run: |
-          # 1. Install Cloudflared
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cloudflared.deb
           sudo dpkg -i cloudflared.deb
           rm -f cloudflared.deb
 
-          # 2. Install LocalXpose
-          curl -s https://api.localxpose.io/api/v2/downloads/loclx-linux-amd64.tar.gz | tar -xz
-          sudo mv loclx /usr/local/bin/
-
-      - name: Start Pure Rust Gateway & Public Tunnels
+      - name: Start Ultra-Fast Rust Gateway & Cloudflare Tunnel
         run: |
-          # Start Rust binary in background
+          # 1. Start Native Pure Rust binary
           ./target/release/pxy-rust &
           sleep 2
 
-          # Start Cloudflare Quick Tunnel (Free, Zero Domain Needed)
-          cloudflared tunnel --url http://127.0.0.1:3000 --no-autoupdate > cf.log 2>&1 &
+          # 2. Launch Cloudflare Quick Tunnel (HTTP/2 Max Throughput)
+          cloudflared tunnel --url http://127.0.0.1:3000 --no-autoupdate --http2-origin > cf.log 2>&1 &
 
-          CF_URL=""
+          URL=""
           for i in {1..40}; do
-            CF_URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" cf.log | head -n 1 || true)
-            if [ -n "$CF_URL" ]; then
+            URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" cf.log | head -n 1 || true)
+            if [ -n "$URL" ]; then
               break
             fi
             sleep 1
           done
 
-          echo "================================================================="
-          echo ">>> YOUR LIVE PURE RUST GATEWAY URL: $CF_URL <<<"
-          echo "================================================================="
-          echo "### 🚀 Live Pure Rust AI Gateway: \`$CF_URL\`" >> $GITHUB_STEP_SUMMARY
-          echo "#### Supported Endpoints:" >> $GITHUB_STEP_SUMMARY
-          echo "- **OpenAI**: \`$CF_URL/v1/chat/completions\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Anthropic**: \`$URL/v1/messages\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Models**: \`$CF_URL/v1/models\`" >> $GITHUB_STEP_SUMMARY
+          if [ -z "$URL" ]; then
+            echo "Failed to start tunnel. Log:"
+            cat cf.log
+            exit 1
+          fi
 
-          # Publish commit status with live URL so tools and scripts can query it automatically
+          echo "================================================================="
+          echo ">>> YOUR ULTRA-FAST LIVE RUST AI GATEWAY URL: $URL <<<"
+          echo "================================================================="
+          echo "### 🚀 Live Ultra-Fast Rust AI Gateway: \`$URL\`" >> $GITHUB_STEP_SUMMARY
+          echo "#### Supported Endpoints:" >> $GITHUB_STEP_SUMMARY
+          echo "- **OpenAI**: \`$URL/v1/chat/completions\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Anthropic**: \`$URL/v1/messages\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Models**: \`$URL/v1/models\`" >> $GITHUB_STEP_SUMMARY
+
+          # Broadcast live URL to commit status for instant fetching
           curl -s -X POST -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github.v3+json" \
             https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }} \
-            -d "{\"state\": \"success\", \"target_url\": \"$CF_URL\", \"description\": \"$CF_URL\", \"context\": \"gateway/live-url\"}" || true
+            -d "{\"state\": \"success\", \"target_url\": \"$URL\", \"description\": \"$URL\", \"context\": \"gateway/live-url\"}" || true
 
-          # Keep runner active until scheduled cycle (295 minutes / ~4.9 hours)
+          # Keep runner active until scheduled 5-hour handover (17700s / ~4.9h)
           sleep 17700 || wait -n
