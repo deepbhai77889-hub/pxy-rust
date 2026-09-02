@@ -13,9 +13,10 @@ use serde_json::{json, Value};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-// Ultra-fast memory allocator for concurrent high-throughput workloads
+// High performance lockless memory allocator
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -23,18 +24,22 @@ struct AppState {
     client: Client,
     keys: Vec<String>,
     current_key_idx: AtomicUsize,
+    upstream_url: RwLock<Option<String>>, // Dynamic target upstream stored in pure Rust memory
 }
 
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt::init();
 
+    let mode = std::env::var("MODE").unwrap_or_else(|_| "gateway".to_string());
+    let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
+    let addr = format!("0.0.0.0:{}", port);
+
     let keys = vec![
         "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".to_string(),
         "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".to_string(),
     ];
 
-    // High performance connection client: Rustls TLS + HTTP/2 Multiplexing + TCP Keep-Alive
     let client = Client::builder()
         .http2_prior_knowledge()
         .tcp_nodelay(true)
@@ -48,43 +53,150 @@ async fn main() {
         client,
         keys,
         current_key_idx: AtomicUsize::new(0),
+        upstream_url: RwLock::new(std::env::var("UPSTREAM_URL").ok()),
     });
 
-    // ⚡ TCP Warm-up in Background: Pre-establishes TLS connection with NVIDIA before first user request!
-    let warm_state = state.clone();
-    tokio::spawn(async move {
-        let warm_payload = json!({
-            "model": "moonshotai/kimi-k3",
-            "messages": [{"role": "user", "content": "ping"}],
-            "max_tokens": 1
+    if mode == "router" {
+        // =========================================================================
+        // MODE A: PURE RUST PERMANENT ROUTER (Redirects/Proxies to latest Runner)
+        // =========================================================================
+        let app = Router::new()
+            .route("/", get(health_check))
+            .route("/health", get(health_check))
+            .route("/_update_tunnel", post(update_tunnel_handler))
+            .fallback(rust_router_proxy_handler)
+            .with_state(state);
+
+        let listener = TcpListener::bind(&addr).await.expect("Failed to bind TcpListener");
+        println!(">>> 🌐 PURE RUST PERMANENT ROUTER RUNNING ON {}", addr);
+        axum::serve(listener, app).await.unwrap();
+    } else {
+        // =========================================================================
+        // MODE B: PURE RUST HIGH-PERFORMANCE AI GATEWAY (NVIDIA Engine)
+        // =========================================================================
+        let warm_state = state.clone();
+        tokio::spawn(async move {
+            let warm_payload = json!({
+                "model": "moonshotai/kimi-k3",
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1
+            });
+            let _ = warm_state.send_nvidia_request(&warm_payload).await;
+            info!("⚡ NVIDIA HTTP/2 Connection Pool Warm-up Completed!");
         });
-        let _ = warm_state.send_nvidia_request(&warm_payload).await;
-        info!("⚡ NVIDIA HTTP/2 Connection Pool Warm-up Completed!");
-    });
 
-    let app = Router::new()
-        .route("/", get(health_check))
-        .route("/health", get(health_check))
-        .route("/v1/models", get(list_models_handler))
-        .route("/models", get(list_models_handler))
-        .route("/v1/chat/completions", post(openai_chat_handler))
-        .route("/chat/completions", post(openai_chat_handler))
-        .route("/v1/messages", post(anthropic_messages_handler))
-        .route("/messages", post(anthropic_messages_handler))
-        .with_state(state);
+        let app = Router::new()
+            .route("/", get(health_check))
+            .route("/health", get(health_check))
+            .route("/v1/models", get(list_models_handler))
+            .route("/models", get(list_models_handler))
+            .route("/v1/chat/completions", post(openai_chat_handler))
+            .route("/chat/completions", post(openai_chat_handler))
+            .route("/v1/messages", post(anthropic_messages_handler))
+            .route("/messages", post(anthropic_messages_handler))
+            .with_state(state);
 
-    let port = std::env::var("PORT").unwrap_or_else(|_| "3000".to_string());
-    let addr = format!("0.0.0.0:{}", port);
-    let listener = TcpListener::bind(&addr).await.expect("Failed to bind TcpListener");
-
-    println!(">>> RUST EXTREME PROXY RUNNING ON {}", addr);
-    axum::serve(listener, app).await.unwrap();
+        let listener = TcpListener::bind(&addr).await.expect("Failed to bind TcpListener");
+        println!(">>> 🚀 PURE RUST AI GATEWAY RUNNING ON {}", addr);
+        axum::serve(listener, app).await.unwrap();
+    }
 }
 
 async fn health_check() -> &'static str {
-    "OK - Rust Gateway Active (SIMD-Optimized + Rustls)"
+    "OK - Pure Rust High-Performance Gateway Active"
 }
 
+// -----------------------------------------------------------------------------------------
+// Pure Rust Permanent Router Fallback (Forwards all streams to active runner)
+// -----------------------------------------------------------------------------------------
+async fn update_tunnel_handler(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    let sync_secret = std::env::var("SYNC_SECRET").unwrap_or_else(|_| "pxy-rust-sync-key-77889".to_string());
+    if let Some(key) = headers.get("x-update-key").and_then(|k| k.to_str().ok()) {
+        if key != sync_secret {
+            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+        }
+    } else {
+        return (StatusCode::UNAUTHORIZED, "Missing x-update-key header").into_response();
+    }
+
+    if let Some(new_url) = payload.get("url").and_then(|u| u.as_str()) {
+        let mut target = state.upstream_url.write().await;
+        *target = Some(new_url.trim_end_matches('/').to_string());
+        info!("🔄 Pure Rust Router successfully updated upstream to: {}", new_url);
+        return (StatusCode::OK, Json(json!({"success": true, "updated_to": new_url}))).into_response();
+    }
+
+    (StatusCode::BAD_REQUEST, "Missing url in body").into_response()
+}
+
+async fn rust_router_proxy_handler(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+) -> Response {
+    let target_base = {
+        let read_guard = state.upstream_url.read().await;
+        read_guard.clone()
+    };
+
+    let base_url = match target_base {
+        Some(url) => url,
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "No active upstream runner connected to Rust Router yet",
+            )
+                .into_response()
+        }
+    };
+
+    let (parts, body) = req.into_parts();
+    let path_and_query = parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    let target_url = format!("{}{}", base_url, path_and_query);
+
+    let mut req_headers = axum::http::HeaderMap::new();
+    for (name, value) in &parts.headers {
+        if name.as_str() != "host" {
+            req_headers.insert(name.clone(), value.clone());
+        }
+    }
+
+    let reqwest_body = reqwest::Body::wrap_stream(body.into_data_stream());
+    let mut builder = state.client.request(parts.method.clone(), &target_url).headers(req_headers);
+
+    if parts.method != axum::http::Method::GET && parts.method != axum::http::Method::HEAD {
+        builder = builder.body(reqwest_body);
+    }
+
+    match builder.send().await {
+        Ok(upstream_resp) => {
+            let status = StatusCode::from_u16(upstream_resp.status().as_u16())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+
+            let mut resp_headers = axum::http::HeaderMap::new();
+            for (name, value) in upstream_resp.headers() {
+                resp_headers.insert(name.clone(), value.clone());
+            }
+
+            let stream = upstream_resp.bytes_stream().map(|item| {
+                item.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            });
+
+            let mut resp = Response::new(Body::from_stream(stream));
+            *resp.status_mut() = status;
+            *resp.headers_mut() = resp_headers;
+            resp
+        }
+        Err(e) => (StatusCode::BAD_GATEWAY, format!("Router upstream error: {}", e)).into_response(),
+    }
+}
+
+// -----------------------------------------------------------------------------------------
+// Helper: NVIDIA Forwarder with Auto Key Switch on Rate-Limit (429/403/503)
+// -----------------------------------------------------------------------------------------
 impl AppState {
     fn get_key(&self, attempt: usize) -> &str {
         let base = self.current_key_idx.load(Ordering::Relaxed);
@@ -137,6 +249,9 @@ impl AppState {
     }
 }
 
+// -----------------------------------------------------------------------------------------
+// OpenAI Endpoint Handler (/v1/chat/completions)
+// -----------------------------------------------------------------------------------------
 async fn openai_chat_handler(
     State(state): State<Arc<AppState>>,
     Json(mut payload): Json<Value>,
@@ -189,6 +304,9 @@ async fn openai_chat_handler(
     }
 }
 
+// -----------------------------------------------------------------------------------------
+// Anthropic Endpoint Handler (/v1/messages)
+// -----------------------------------------------------------------------------------------
 async fn anthropic_messages_handler(
     State(state): State<Arc<AppState>>,
     Json(anthropic_req): Json<Value>,
@@ -263,7 +381,6 @@ async fn anthropic_messages_handler(
                                             if data.trim() == "[DONE]" {
                                                 continue;
                                             }
-                                            // Ultra-fast zero copy text extraction
                                             if let Some(content_idx) = data.find("\"content\":") {
                                                 let sub = &data[content_idx + 10..];
                                                 if sub.starts_with('"') {
@@ -278,8 +395,7 @@ async fn anthropic_messages_handler(
                                                     }
                                                 }
                                             }
-                                            
-                                            // Fallback to normal parser if reasoning chunk or complex JSON
+
                                             if let Ok(val) = serde_json::from_str::<Value>(data) {
                                                 if let Some(delta) = val.pointer("/choices/0/delta/content").and_then(|c| c.as_str()) {
                                                     let delta_evt = json!({
