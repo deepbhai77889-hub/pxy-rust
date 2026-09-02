@@ -16,7 +16,6 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-// High performance lockless memory allocator
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
@@ -24,7 +23,7 @@ struct AppState {
     client: Client,
     keys: Vec<String>,
     current_key_idx: AtomicUsize,
-    upstream_url: RwLock<Option<String>>, // Dynamic target upstream stored in pure Rust memory
+    upstream_url: RwLock<Option<String>>,
 }
 
 #[tokio::main]
@@ -57,9 +56,6 @@ async fn main() {
     });
 
     if mode == "router" {
-        // =========================================================================
-        // MODE A: PURE RUST PERMANENT ROUTER (Redirects/Proxies to latest Runner)
-        // =========================================================================
         let app = Router::new()
             .route("/", get(health_check))
             .route("/health", get(health_check))
@@ -71,9 +67,6 @@ async fn main() {
         println!(">>> 🌐 PURE RUST PERMANENT ROUTER RUNNING ON {}", addr);
         axum::serve(listener, app).await.unwrap();
     } else {
-        // =========================================================================
-        // MODE B: PURE RUST HIGH-PERFORMANCE AI GATEWAY (NVIDIA Engine)
-        // =========================================================================
         let warm_state = state.clone();
         tokio::spawn(async move {
             let warm_payload = json!({
@@ -106,9 +99,6 @@ async fn health_check() -> &'static str {
     "OK - Pure Rust High-Performance Gateway Active"
 }
 
-// -----------------------------------------------------------------------------------------
-// Pure Rust Permanent Router Fallback (Forwards all streams to active runner)
-// -----------------------------------------------------------------------------------------
 async fn update_tunnel_handler(
     State(state): State<Arc<AppState>>,
     headers: axum::http::HeaderMap,
@@ -194,9 +184,6 @@ async fn rust_router_proxy_handler(
     }
 }
 
-// -----------------------------------------------------------------------------------------
-// Helper: NVIDIA Forwarder with Auto Key Switch on Rate-Limit (429/403/503)
-// -----------------------------------------------------------------------------------------
 impl AppState {
     fn get_key(&self, attempt: usize) -> &str {
         let base = self.current_key_idx.load(Ordering::Relaxed);
@@ -249,9 +236,6 @@ impl AppState {
     }
 }
 
-// -----------------------------------------------------------------------------------------
-// OpenAI Endpoint Handler (/v1/chat/completions)
-// -----------------------------------------------------------------------------------------
 async fn openai_chat_handler(
     State(state): State<Arc<AppState>>,
     Json(mut payload): Json<Value>,
@@ -304,9 +288,6 @@ async fn openai_chat_handler(
     }
 }
 
-// -----------------------------------------------------------------------------------------
-// Anthropic Endpoint Handler (/v1/messages)
-// -----------------------------------------------------------------------------------------
 async fn anthropic_messages_handler(
     State(state): State<Arc<AppState>>,
     Json(anthropic_req): Json<Value>,
@@ -357,14 +338,13 @@ async fn anthropic_messages_handler(
                     });
                     yield Ok::<Bytes, std::io::Error>(Bytes::from(format!("event: message_start\ndata: {}\n\n", start_evt)));
 
-                    let content_start = json!({
-                        "type": "content_block_start",
-                        "index": 0,
-                        "content_block": { "type": "text", "text": "" }
-                    });
-                    yield Ok(Bytes::from(format!("event: content_block_start\ndata: {}\n\n", content_start)));
-
+                    let mut text_block_started = false;
+                    let mut current_block_index = 0usize;
+                    let mut tool_block_active = false;
+                    let mut current_tool_id = String::new();
+                    let mut current_tool_name = String::new();
                     let mut buffer = String::with_capacity(4096);
+
                     tokio::pin!(byte_stream);
 
                     while let Some(chunk_res) = byte_stream.next().await {
@@ -381,32 +361,78 @@ async fn anthropic_messages_handler(
                                             if data.trim() == "[DONE]" {
                                                 continue;
                                             }
-                                            if let Some(content_idx) = data.find("\"content\":") {
-                                                let sub = &data[content_idx + 10..];
-                                                if sub.starts_with('"') {
-                                                    if let Some(end_quote) = sub[1..].find('"') {
-                                                        let delta = &sub[1..=end_quote];
-                                                        let delta_evt = format!(
-                                                            "{{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"{}\"}}}}",
-                                                            delta.replace('\\', "\\\\").replace('"', "\\\"")
-                                                        );
-                                                        yield Ok(Bytes::from(format!("event: content_block_delta\ndata: {}\n\n", delta_evt)));
-                                                        continue;
-                                                    }
-                                                }
-                                            }
 
                                             if let Ok(val) = serde_json::from_str::<Value>(data) {
-                                                if let Some(delta) = val.pointer("/choices/0/delta/content").and_then(|c| c.as_str()) {
-                                                    let delta_evt = json!({
-                                                        "type": "content_block_delta",
-                                                        "index": 0,
-                                                        "delta": {
-                                                            "type": "text_delta",
-                                                            "text": delta
+                                                let delta = val.pointer("/choices/0/delta");
+                                                
+                                                // 1. Check for standard Text content chunk
+                                                if let Some(content) = delta.and_then(|d| d.get("content")).and_then(|c| c.as_str()) {
+                                                    if !content.is_empty() {
+                                                        if !text_block_started {
+                                                            let content_start = json!({
+                                                                "type": "content_block_start",
+                                                                "index": current_block_index,
+                                                                "content_block": { "type": "text", "text": "" }
+                                                            });
+                                                            yield Ok(Bytes::from(format!("event: content_block_start\ndata: {}\n\n", content_start)));
+                                                            text_block_started = true;
                                                         }
-                                                    });
-                                                    yield Ok(Bytes::from(format!("event: content_block_delta\ndata: {}\n\n", delta_evt)));
+
+                                                        let delta_evt = json!({
+                                                            "type": "content_block_delta",
+                                                            "index": current_block_index,
+                                                            "delta": { "type": "text_delta", "text": content }
+                                                        });
+                                                        yield Ok(Bytes::from(format!("event: content_block_delta\ndata: {}\n\n", delta_evt)));
+                                                    }
+                                                }
+
+                                                // 2. Check for Tool Calls chunk
+                                                if let Some(tool_calls) = delta.and_then(|d| d.get("tool_calls")).and_then(|t| t.as_array()) {
+                                                    for tc in tool_calls {
+                                                        if let Some(func) = tc.get("function") {
+                                                            let name = func.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                                                            let args_piece = func.get("arguments").and_then(|a| a.as_str()).unwrap_or("");
+                                                            let call_id = tc.get("id").and_then(|i| i.as_str()).unwrap_or("");
+
+                                                            if !name.is_empty() || !call_id.is_empty() {
+                                                                if text_block_started {
+                                                                    let block_stop = json!({ "type": "content_block_stop", "index": current_block_index });
+                                                                    yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {}\n\n", block_stop)));
+                                                                    current_block_index += 1;
+                                                                    text_block_started = false;
+                                                                }
+
+                                                                current_tool_id = if !call_id.is_empty() { call_id.to_string() } else { format!("call_{}", current_block_index) };
+                                                                current_tool_name = name.to_string();
+
+                                                                let tool_start = json!({
+                                                                    "type": "content_block_start",
+                                                                    "index": current_block_index,
+                                                                    "content_block": {
+                                                                        "type": "tool_use",
+                                                                        "id": current_tool_id,
+                                                                        "name": current_tool_name,
+                                                                        "input": {}
+                                                                    }
+                                                                });
+                                                                yield Ok(Bytes::from(format!("event: content_block_start\ndata: {}\n\n", tool_start)));
+                                                                tool_block_active = true;
+                                                            }
+
+                                                            if !args_piece.is_empty() && tool_block_active {
+                                                                let tool_delta = json!({
+                                                                    "type": "content_block_delta",
+                                                                    "index": current_block_index,
+                                                                    "delta": {
+                                                                        "type": "input_json_delta",
+                                                                        "partial_json": args_piece
+                                                                    }
+                                                                });
+                                                                yield Ok(Bytes::from(format!("event: content_block_delta\ndata: {}\n\n", tool_delta)));
+                                                            }
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -416,12 +442,16 @@ async fn anthropic_messages_handler(
                         }
                     }
 
-                    let block_stop = json!({ "type": "content_block_stop", "index": 0 });
-                    yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {}\n\n", block_stop)));
+                    // Close any active content blocks
+                    if text_block_started || tool_block_active {
+                        let block_stop = json!({ "type": "content_block_stop", "index": current_block_index });
+                        yield Ok(Bytes::from(format!("event: content_block_stop\ndata: {}\n\n", block_stop)));
+                    }
 
+                    let stop_reason = if tool_block_active { "tool_use" } else { "end_turn" };
                     let msg_delta = json!({
                         "type": "message_delta",
-                        "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+                        "delta": { "stop_reason": stop_reason, "stop_sequence": null },
                         "usage": { "output_tokens": 50 }
                     });
                     yield Ok(Bytes::from(format!("event: message_delta\ndata: {}\n\n", msg_delta)));
