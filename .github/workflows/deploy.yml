@@ -30,66 +30,49 @@ jobs:
       - name: Build Optimized Binary
         run: cargo build --release
 
-      - name: Install Cloudflared
+      - name: Install Cloudflared & LocalXpose
         run: |
+          # 1. Install Cloudflared
           curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cloudflared.deb
           sudo dpkg -i cloudflared.deb
           rm -f cloudflared.deb
 
-      - name: Start Rust Gateway & Cloudflare Tunnel
-        env:
-          CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
-          PERMANENT_WORKER_URL: ${{ secrets.PERMANENT_WORKER_URL }}
-          SYNC_SECRET: ${{ secrets.SYNC_SECRET }}
+          # 2. Install LocalXpose
+          curl -s https://api.localxpose.io/api/v2/downloads/loclx-linux-amd64.tar.gz | tar -xz
+          sudo mv loclx /usr/local/bin/
+
+      - name: Start Pure Rust Gateway & Public Tunnels
         run: |
-          # 1. Start Rust binary
+          # Start Rust binary in background
           ./target/release/pxy-rust &
           sleep 2
 
-          # 2. Start Cloudflare Tunnel (Fixed Named Tunnel OR Auto-Registered Quick Tunnel)
-          if [ -n "$CLOUDFLARE_TUNNEL_TOKEN" ]; then
-            echo "Starting Fixed Named Cloudflare Tunnel..."
-            cloudflared tunnel --no-autoupdate run --token "$CLOUDFLARE_TUNNEL_TOKEN" &
-            URL="https://your-custom-domain.com"
-          else
-            cloudflared tunnel --url http://127.0.0.1:3000 --no-autoupdate > tunnel.log 2>&1 &
+          # Start Cloudflare Quick Tunnel (Free, Zero Domain Needed)
+          cloudflared tunnel --url http://127.0.0.1:3000 --no-autoupdate > cf.log 2>&1 &
 
-            URL=""
-            for i in {1..40}; do
-              URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" tunnel.log | head -n 1 || true)
-              if [ -n "$URL" ]; then
-                break
-              fi
-              sleep 1
-            done
-          fi
-
-          if [ -z "$URL" ]; then
-            echo "Failed to start tunnel. Logs:"
-            cat tunnel.log
-            exit 1
-          fi
+          CF_URL=""
+          for i in {1..40}; do
+            CF_URL=$(grep -oE "https://[a-zA-Z0-9-]+\.trycloudflare\.com" cf.log | head -n 1 || true)
+            if [ -n "$CF_URL" ]; then
+              break
+            fi
+            sleep 1
+          done
 
           echo "================================================================="
-          echo ">>> CURRENT WORKFLOW TUNNEL URL: $URL <<<"
+          echo ">>> YOUR LIVE PURE RUST GATEWAY URL: $CF_URL <<<"
           echo "================================================================="
-          echo "### 🚀 Current Active URL: \`$URL\`" >> $GITHUB_STEP_SUMMARY
+          echo "### 🚀 Live Pure Rust AI Gateway: \`$CF_URL\`" >> $GITHUB_STEP_SUMMARY
+          echo "#### Supported Endpoints:" >> $GITHUB_STEP_SUMMARY
+          echo "- **OpenAI**: \`$CF_URL/v1/chat/completions\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Anthropic**: \`$URL/v1/messages\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Models**: \`$CF_URL/v1/models\`" >> $GITHUB_STEP_SUMMARY
 
-          # 3. If Permanent Worker URL is configured, auto-update the router with zero downtime
-          if [ -n "$PERMANENT_WORKER_URL" ]; then
-            echo "Syncing new tunnel URL to Permanent Gateway: $PERMANENT_WORKER_URL..."
-            curl -s -X POST "$PERMANENT_WORKER_URL/_update_tunnel" \
-              -H "Content-Type: application/json" \
-              -H "x-update-key: ${SYNC_SECRET:-pxy-rust-sync-key-77889}" \
-              -d "{\"url\": \"$URL\"}" || true
-            echo "### 🌐 Permanent Fixed URL: \`$PERMANENT_WORKER_URL\`" >> $GITHUB_STEP_SUMMARY
-          fi
-
-          # Publish commit status with target_url
+          # Publish commit status with live URL so tools and scripts can query it automatically
           curl -s -X POST -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/vnd.github.v3+json" \
             https://api.github.com/repos/${{ github.repository }}/statuses/${{ github.sha }} \
-            -d "{\"state\": \"success\", \"target_url\": \"$URL\", \"description\": \"$URL\", \"context\": \"gateway/live-url\"}" || true
+            -d "{\"state\": \"success\", \"target_url\": \"$CF_URL\", \"description\": \"$CF_URL\", \"context\": \"gateway/live-url\"}" || true
 
           # Keep runner active until scheduled cycle (295 minutes / ~4.9 hours)
           sleep 17700 || wait -n
